@@ -631,7 +631,9 @@ func TestBoolWithInverseFlagCount(t *testing.T) {
 					wantCount := 2
 					if onlyOnce {
 						require.ErrorContains(t, err, "can't duplicate this flag")
-						wantCount = 1
+						// The duplicate run fails, so it is rolled back: the
+						// flag and the external counter look untouched.
+						wantCount = 0
 					} else {
 						require.NoError(t, err)
 					}

@@ -91,16 +91,27 @@ outer:
 // arguments are parsed according to the Flag and Command
 // definitions and the matching Action functions are run.
 func (cmd *Command) Run(ctx context.Context, osArgs []string) (deferErr error) {
-	_, deferErr = cmd.run(ctx, osArgs)
+	_, deferErr = cmd.run(ctx, osArgs, nil)
 	return deferErr
 }
 
-func (cmd *Command) run(ctx context.Context, osArgs []string) (_ context.Context, deferErr error) {
+func (cmd *Command) run(ctx context.Context, osArgs []string, tx *parseTransaction) (_ context.Context, deferErr error) {
 	tracef("running with arguments %[1]q (cmd=%[2]q)", osArgs, cmd.Name)
+
+	// The root frame owns the parse transaction for the whole run, including
+	// every resolved sub-command frame. It commits on success and restores the
+	// pre-run state when parsing or validation fails anywhere in the chain.
+	if tx == nil {
+		tx = newParseTransaction()
+		defer tx.finalize()
+	}
+	tx.snapshotCommand(cmd)
+
 	cmd.setupDefaults(osArgs)
 
 	// Validate StopOnNthArg
 	if cmd.StopOnNthArg != nil && *cmd.StopOnNthArg < 0 {
+		tx.markFailed()
 		return ctx, fmt.Errorf("StopOnNthArg must be non-negative, got %d", *cmd.StopOnNthArg)
 	}
 
@@ -154,7 +165,8 @@ func (cmd *Command) run(ctx context.Context, osArgs []string) (_ context.Context
 		if cmd.hasPersistentFlagOnAncestor(f) {
 			continue
 		}
-		if err := f.PreParse(); err != nil {
+		if err := tx.beginFlag(f); err != nil {
+			tx.markFailed()
 			return ctx, err
 		}
 	}
@@ -171,6 +183,11 @@ func (cmd *Command) run(ctx context.Context, osArgs []string) (_ context.Context
 	tracef("using post-parse arguments %[1]q (cmd=%[2]q)", args, cmd.Name)
 
 	if shouldRunCompletion(cmd) {
+		// Parsing must succeed atomically even when the error is swallowed by
+		// the completion path: a failed parse rolls back before returning.
+		if err != nil {
+			tx.markFailed()
+		}
 		var beforeErr error
 		if ctx, beforeErr = runBefore(ctx, commandChain(cmd)); beforeErr != nil {
 			return ctx, beforeErr
@@ -182,6 +199,10 @@ func (cmd *Command) run(ctx context.Context, osArgs []string) (_ context.Context
 	if err != nil {
 		tracef("setting deferErr from %[1]q (cmd=%[2]q)", err, cmd.Name)
 		deferErr = err
+
+		// Flag parsing failed: nothing parsed in this run may survive, even
+		// when the help branch below converts the error into a nil return.
+		tx.markFailed()
 
 		cmd.isInError = true
 		if cmd.checkHelp() {
@@ -235,6 +256,9 @@ func (cmd *Command) run(ctx context.Context, osArgs []string) (_ context.Context
 		cmd.setMultiValueParsingConfig(flag)
 		isSet := flag.IsSet()
 		if err := flag.PostParse(); err != nil {
+			// A value coming from an environment variable, file or another
+			// registered Source could not be parsed: roll back the run.
+			tx.markFailed()
 			return ctx, err
 		}
 		// add env set flags here
@@ -277,6 +301,8 @@ func (cmd *Command) run(ctx context.Context, osArgs []string) (_ context.Context
 						}
 					}
 				}
+				// Mutually exclusive flag validation failed: roll back.
+				tx.markFailed()
 				return ctx, err
 			}
 		}
@@ -324,7 +350,7 @@ func (cmd *Command) run(ctx context.Context, osArgs []string) (_ context.Context
 		// It is important that we overwrite the ctx variable in the current
 		// function so any defer'd functions use the new context returned
 		// from the sub command.
-		ctx, err = subCmd.run(ctx, cmd.Args().Slice())
+		ctx, err = subCmd.run(ctx, cmd.Args().Slice(), tx)
 		return ctx, err
 	}
 
@@ -339,6 +365,8 @@ func (cmd *Command) run(ctx context.Context, osArgs []string) (_ context.Context
 	// Run ArgValidator from the nearest ancestor that sets one.
 	if validator := findArgValidator(cmd); validator != nil {
 		if err := validator(ctx, cmd); err != nil {
+			// Positional argument validation failed: roll back the run.
+			tx.markFailed()
 			deferErr = cmd.handleExitCoder(ctx, err)
 			return ctx, deferErr
 		}
@@ -367,6 +395,9 @@ func (cmd *Command) run(ctx context.Context, osArgs []string) (_ context.Context
 		requiredErr = err
 	}
 	if requiredErr != nil {
+		// Required flag or required positional argument validation failed:
+		// roll back the run.
+		tx.markFailed()
 		return cmd.handleRequiredError(ctx, requiredErr)
 	}
 
@@ -374,11 +405,15 @@ func (cmd *Command) run(ctx context.Context, osArgs []string) (_ context.Context
 	if len(cmd.Arguments) > 0 {
 		rargs := cmd.Args().Slice()
 		tracef("calling argparse with %[1]v", rargs)
+		tx.snapshotArguments(cmd.Arguments)
 		for _, arg := range cmd.Arguments {
 			var err error
 			rargs, err = arg.Parse(rargs)
 			if err != nil {
 				tracef("calling with %[1]v (cmd=%[2]q)", err, cmd.Name)
+				// Positional argument parsing failed: roll back the run,
+				// including earlier arguments that were already written.
+				tx.markFailed()
 				if _, ok := err.(*errRequiredArguments); ok {
 					return cmd.handleRequiredError(ctx, err)
 				}

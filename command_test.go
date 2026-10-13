@@ -5503,15 +5503,18 @@ func TestCheckRequiredFlags(t *testing.T) {
 			}
 
 			cmd := &Command{
-				Name:  "foo",
-				Flags: test.flags,
+				Name:      "foo",
+				Flags:     test.flags,
+				Writer:    io.Discard,
+				ErrWriter: io.Discard,
 			}
 			args := []string{"foo"}
 			args = append(args, test.parseInput...)
-			_ = cmd.Run(context.Background(), args)
+			err := cmd.Run(context.Background(), args)
 
-			err := cmd.checkAllRequiredFlags()
-
+			// A failed required-flag check rolls the run back, so the error
+			// is asserted on the Run result itself rather than by inspecting
+			// post-run flag state.
 			// assertions
 			if test.expectedAnError {
 				assert.NotNil(t, err)

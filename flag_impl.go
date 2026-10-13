@@ -85,6 +85,19 @@ type FlagBase[T any, C any, VC ValueCreator[T, C]] struct {
 	stringer   FlagStringFunc // optional per-flag override of FlagStringer
 
 	multiValueConfig *multiValueParsingConfig // last parsing config passed to value
+
+	// Per-run parse transaction state. The fields are only populated while a
+	// Command.Run is in progress (see parse_transaction.go).
+	txActive      bool  // whether a parse scope is open
+	txPrevValue   Value // holder as observed before the run
+	txPrevTyped   T     // typed value as observed before the run
+	txRestore     any   // opaque in-place payload snapshot
+	txCount       int   // count before the run
+	txHasBeenSet  bool  // hasBeenSet before the run
+	txFromSource  bool  // fromSource before the run
+	txApplied     bool  // applied before the run
+	txBoolCounter *int  // optional external bool counter (BoolConfig.Count)
+	txBoolCount   int   // external bool counter value before the run
 }
 
 // GetValue returns the flags value as string representation and an empty
@@ -218,6 +231,124 @@ func (f *FlagBase[T, C, V]) PreParse() error {
 	}
 	f.applied = true
 	return nil
+}
+
+// beginParse opens the per-run parse scope. It mirrors PreParse for the value
+// holder while additionally snapshotting every observable piece of state so
+// that rollbackParse can restore it, and resets the per-run bookkeeping so
+// repeated runs start from a clean slate.
+func (f *FlagBase[T, C, V]) beginParse() error {
+	tracef("begin parse scope (flag=%[1]q)", f.Name)
+
+	f.txActive = true
+	f.txPrevValue = f.value
+	switch {
+	case f.value != nil:
+		f.txPrevTyped = f.getTypedValue()
+	case f.Destination != nil:
+		f.txPrevTyped = *f.Destination
+	default:
+		f.txPrevTyped = f.Value
+	}
+	f.txCount = f.count
+	f.txHasBeenSet = f.hasBeenSet
+	f.txFromSource = f.fromSource
+	f.txApplied = f.applied
+	f.txRestore = nil
+	f.txBoolCounter = nil
+
+	// Reset to defaults exactly like PreParse, but with per-run bookkeeping
+	// cleared so the run cannot observe state left by a previous run.
+	f.value = f.newValue()
+	f.count = 0
+	f.hasBeenSet = false
+	f.fromSource = false
+	f.applied = true
+
+	// The external bool counter is a caller-owned accumulator: successful
+	// runs add to it as before, failed runs restore the captured value. It
+	// is deliberately not zeroed at begin.
+	if bv, ok := f.value.(*boolValue); ok && bv.count != nil {
+		f.txBoolCounter = bv.count
+		f.txBoolCount = *bv.count
+	}
+
+	// Interface-typed holders mutate their payload object in place; capture
+	// its pre-parse content so an in-place restore is possible.
+	if rv, ok := f.value.(restorableValue); ok {
+		f.txRestore = rv.snapshotValue()
+	}
+
+	// Validate the given default or values set from external sources as well
+	if f.Validator != nil && f.ValidateDefaults {
+		if err := f.Validator(f.getTypedValue()); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// commitParse closes a successful parse scope and releases the snapshot.
+func (f *FlagBase[T, C, V]) commitParse() {
+	if !f.txActive {
+		return
+	}
+	tracef("commit parse scope (flag=%[1]q)", f.Name)
+	f.txActive = false
+	f.txPrevValue = nil
+	f.txRestore = nil
+	f.txBoolCounter = nil
+	var zero T
+	f.txPrevTyped = zero
+}
+
+// rollbackParse closes a failed parse scope and restores every observable
+// piece of state to what beginParse captured.
+func (f *FlagBase[T, C, V]) rollbackParse() {
+	if !f.txActive {
+		return
+	}
+	tracef("rollback parse scope (flag=%[1]q)", f.Name)
+
+	// Holders for interface-typed values wrap the same payload object even
+	// after rebuilding the holder, so restore the payload through the holder
+	// that parsing actually used first.
+	inPlace, _ := f.value.(restorableValue)
+
+	if f.txPrevValue == nil {
+		// Flag that had never been parsed before this run. Drop the holder so
+		// Get() falls back to the declared default again, and put any
+		// Destination back to the exact content it had before the call.
+		if f.Destination != nil {
+			*f.Destination = f.txPrevTyped
+		}
+		f.value = nil
+	} else {
+		target := f.Destination
+		if target == nil {
+			target = new(T)
+		}
+		f.value = f.creator.Create(f.txPrevTyped, target, f.Config)
+	}
+
+	if inPlace != nil && f.txRestore != nil {
+		inPlace.restoreValue(f.txRestore)
+	}
+	if f.txBoolCounter != nil {
+		*f.txBoolCounter = f.txBoolCount
+	}
+
+	f.count = f.txCount
+	f.hasBeenSet = f.txHasBeenSet
+	f.fromSource = f.txFromSource
+	f.applied = f.txApplied
+
+	f.txActive = false
+	f.txPrevValue = nil
+	f.txRestore = nil
+	f.txBoolCounter = nil
+	var zero T
+	f.txPrevTyped = zero
 }
 
 // Set applies given value from string

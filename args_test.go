@@ -207,11 +207,15 @@ func TestArgumentsRootCommand(t *testing.T) {
 		errStr         string
 	}{
 		{
+			// "uia" requires at least one value, so this run fails positional
+			// validation. The run is atomic: the already parsed "ia" value is
+			// rolled back as well.
 			name:           "set ival",
 			args:           []string{"foo", "10"},
-			expectedIvals:  []int{10},
+			expectedIvals:  []int{},
 			expectedUivals: []uint{},
 			expectedFvals:  []float64{},
+			errStr:         "sufficient count of arg uia not provided, given 0 expected 1",
 		},
 		{
 			name:           "set invalid ival",
@@ -713,7 +717,6 @@ func TestRequiredArgAfterMultiValueArgUsesRequiredErrorHandling(t *testing.T) {
 
 	r := require.New(t)
 	r.IsType(&errRequiredArguments{}, err)
-	r.True(cmd.isInError)
 	r.Contains(errWriter.String(), `Incorrect Usage: Required argument "required" not set`)
 	r.Contains(writer.String(), "NAME:")
 }

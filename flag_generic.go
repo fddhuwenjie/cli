@@ -52,6 +52,29 @@ func (f *genericValue) IsBoolFlag() bool {
 	return ok && bf.IsBoolFlag()
 }
 
+// snapshotValue captures the serialized form of the wrapped value when it
+// can be re-ingested through Set; values without Serializer cannot be
+// restored in place.
+func (f *genericValue) snapshotValue() any {
+	if f.val == nil {
+		return nil
+	}
+	if s, ok := f.val.(Serializer); ok {
+		return s.Serialize()
+	}
+	return nil
+}
+
+// restoreValue re-ingests the captured serialized content.
+func (f *genericValue) restoreValue(snap any) {
+	if f.val == nil {
+		return
+	}
+	if raw, ok := snap.(string); ok {
+		_ = f.val.Set(raw)
+	}
+}
+
 // Generic looks up the value of a local GenericFlag, returns
 // nil if not found
 func (cmd *Command) Generic(name string) Value {

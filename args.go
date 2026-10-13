@@ -163,6 +163,40 @@ func (a *ArgumentBase[T, C, VC]) Get() any {
 	return a.Value
 }
 
+// argumentParseState is the opaque per-run snapshot of an ArgumentBase.
+type argumentParseState[T any] struct {
+	value       *T
+	destination *T
+	destValue   T
+}
+
+// saveParseState captures the observable single-argument state (parsed value
+// and Destination) before the run parses positional arguments.
+func (a *ArgumentBase[T, C, VC]) saveParseState() any {
+	st := &argumentParseState[T]{}
+	if a.value != nil {
+		v := *a.value
+		st.value = &v
+	}
+	if a.Destination != nil {
+		st.destination = a.Destination
+		st.destValue = *a.Destination
+	}
+	return st
+}
+
+// restoreParseState restores the snapshot after a failed run.
+func (a *ArgumentBase[T, C, VC]) restoreParseState(snap any) {
+	st, ok := snap.(*argumentParseState[T])
+	if !ok {
+		return
+	}
+	a.value = st.value
+	if a.Destination != nil && st.destination != nil {
+		*a.Destination = st.destValue
+	}
+}
+
 // ArgumentsBase is a base type for slice arguments
 type ArgumentsBase[T any, C any, VC ValueCreator[T, C]] struct {
 	Name        string `json:"name"`      // the name of this argument
@@ -242,6 +276,36 @@ func (a *ArgumentsBase[T, C, VC]) Get() any {
 		return a.values
 	}
 	return []T{}
+}
+
+// argumentsParseState is the opaque per-run snapshot of an ArgumentsBase.
+type argumentsParseState[T any] struct {
+	values      []T
+	destination *[]T
+	destValue   []T
+}
+
+// saveParseState captures the observable repeated-argument state (parsed
+// values and Destination) before the run parses positional arguments.
+func (a *ArgumentsBase[T, C, VC]) saveParseState() any {
+	st := &argumentsParseState[T]{values: a.values}
+	if a.Destination != nil {
+		st.destination = a.Destination
+		st.destValue = *a.Destination
+	}
+	return st
+}
+
+// restoreParseState restores the snapshot after a failed run.
+func (a *ArgumentsBase[T, C, VC]) restoreParseState(snap any) {
+	st, ok := snap.(*argumentsParseState[T])
+	if !ok {
+		return
+	}
+	a.values = st.values
+	if a.Destination != nil && st.destination != nil {
+		*a.Destination = st.destValue
+	}
 }
 
 type (

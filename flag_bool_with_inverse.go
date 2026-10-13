@@ -40,6 +40,18 @@ type BoolWithInverseFlag struct {
 	pset       bool
 	nset       bool
 	stringer   FlagStringFunc // optional per-flag override of FlagStringer
+
+	// Per-run parse transaction state (see parse_transaction.go).
+	txActive     bool
+	txPrevValue  Value
+	txPrevBool   bool
+	txCount      int
+	txHasBeenSet bool
+	txFromSource bool
+	txApplied    bool
+	txPset       bool
+	txNset       bool
+	txBoolCount  int
 }
 
 // SetStringer overrides the [FlagStringFunc] used by this flag's String
@@ -103,6 +115,109 @@ func (bif *BoolWithInverseFlag) PreParse() error {
 	}
 	bif.applied = true
 	return nil
+}
+
+// beginParse opens the per-run parse scope with a snapshot and a clean slate,
+// mirroring PreParse but additionally resetting the per-run bookkeeping so
+// repeated runs do not accumulate counts or set state.
+func (bif *BoolWithInverseFlag) beginParse() error {
+	tracef("begin parse scope (flag=%[1]q)", bif.Name)
+
+	bif.txActive = true
+	bif.txPrevValue = bif.value
+	switch {
+	case bif.value != nil:
+		bif.txPrevBool = bif.value.Get().(bool)
+	case bif.Destination != nil:
+		bif.txPrevBool = *bif.Destination
+	default:
+		bif.txPrevBool = bif.Value
+	}
+	bif.txCount = bif.count
+	bif.txHasBeenSet = bif.hasBeenSet
+	bif.txFromSource = bif.fromSource
+	bif.txApplied = bif.applied
+	bif.txPset = bif.pset
+	bif.txNset = bif.nset
+	// The external counter is a caller-owned accumulator: successful runs
+	// keep adding; failed runs restore the captured value. It is deliberately
+	// not zeroed at begin.
+	if bif.Config.Count != nil {
+		bif.txBoolCount = *bif.Config.Count
+	}
+
+	dest := bif.Destination
+	if dest == nil {
+		dest = new(bool)
+	}
+	*dest = bif.Value
+	bif.value = &boolValue{
+		destination: dest,
+		count:       bif.Config.Count,
+	}
+	bif.count = 0
+	bif.hasBeenSet = false
+	bif.fromSource = false
+	bif.applied = true
+	bif.pset = false
+	bif.nset = false
+
+	// Validate the given default or values set from external sources as well
+	if bif.Validator != nil && bif.ValidateDefaults {
+		if err := bif.Validator(bif.value.Get().(bool)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// commitParse closes a successful parse scope and releases the snapshot.
+func (bif *BoolWithInverseFlag) commitParse() {
+	if !bif.txActive {
+		return
+	}
+	tracef("commit parse scope (flag=%[1]q)", bif.Name)
+	bif.txActive = false
+	bif.txPrevValue = nil
+}
+
+// rollbackParse closes a failed parse scope and restores the snapshot.
+func (bif *BoolWithInverseFlag) rollbackParse() {
+	if !bif.txActive {
+		return
+	}
+	tracef("rollback parse scope (flag=%[1]q)", bif.Name)
+
+	if bif.txPrevValue == nil {
+		// Flag that had never been parsed before this run.
+		if bif.Destination != nil {
+			*bif.Destination = bif.txPrevBool
+		}
+		bif.value = nil
+	} else {
+		dest := bif.Destination
+		if dest == nil {
+			dest = new(bool)
+		}
+		*dest = bif.txPrevBool
+		bif.value = &boolValue{
+			destination: dest,
+			count:       bif.Config.Count,
+		}
+	}
+	if bif.Config.Count != nil {
+		*bif.Config.Count = bif.txBoolCount
+	}
+
+	bif.count = bif.txCount
+	bif.hasBeenSet = bif.txHasBeenSet
+	bif.fromSource = bif.txFromSource
+	bif.applied = bif.txApplied
+	bif.pset = bif.txPset
+	bif.nset = bif.txNset
+
+	bif.txActive = false
+	bif.txPrevValue = nil
 }
 
 func (bif *BoolWithInverseFlag) PostParse() error {

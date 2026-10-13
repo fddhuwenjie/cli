@@ -63,6 +63,29 @@ func (t *textValue) Set(val string) error {
 
 func (t *textValue) Get() any { return t.destination }
 
+// snapshotValue captures the marshaled form of the in-place payload so a
+// failed parse run can undo UnmarshalText calls.
+func (t *textValue) snapshotValue() any {
+	if t.destination == nil {
+		return nil
+	}
+	raw, err := t.destination.MarshalText()
+	if err != nil {
+		return nil
+	}
+	return raw
+}
+
+// restoreValue re-applies the captured marshaled content to the payload.
+func (t *textValue) restoreValue(snap any) {
+	if t.destination == nil {
+		return
+	}
+	if raw, ok := snap.([]byte); ok {
+		_ = t.destination.UnmarshalText(raw)
+	}
+}
+
 func (t *textValue) String() string {
 	if t.destination == nil {
 		return ""
